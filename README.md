@@ -20,6 +20,7 @@ This package provides a complete interface for integrating comment threads, voti
   - [Authentication](#authentication)
   - [Comments & Threads](#comments--threads)
   - [Interactions (Votes & Reports)](#interactions-votes--reports)
+  - [Extensions](#-extensions)
 - [Error Handling](#-error-handling)
 - [Advanced Configuration](#-advanced-configuration)
 
@@ -135,16 +136,19 @@ final response = await client.listComments(
   limit: 20,
 );
 
-final comments = response.items;
+final comments = response.data;
+final totalCount = response.count;
 final nextCursor = response.nextCursor; // Use for infinite scroll
 ```
 
 **Fetching Replies (Threaded)**
 ```dart
-final replies = await client.listReplies(
+final response = await client.listReplies(
   'root_comment_id',
   limit: 10,
 );
+
+final replies = response.data;
 ```
 
 **Posting a Comment**
@@ -152,6 +156,7 @@ final replies = await client.listReplies(
 final newComment = await client.createComment(
   'media_id_101', 
   'This episode was a masterpiece!',
+  client: 'my_app_v1',
 );
 ```
 
@@ -160,10 +165,28 @@ final newComment = await client.createComment(
 final reply = await client.createReply(
   'parent_comment_id',
   'I completely agree.',
+  client: 'my_app_v1',
 );
 ```
 
 ### Interactions (Votes & Reports)
+
+You can interact with comments directly using the extension methods:
+
+```dart
+// Vote
+await comment.upVote(client);
+await comment.downVote(client);
+await comment.removeVote(client);
+
+// Delete
+await comment.delete(client);
+
+// Report
+await comment.report(client, 'Contains unmarked spoilers');
+```
+
+Alternatively, use the client methods directly:
 
 **Voting**
 ```dart
@@ -183,6 +206,31 @@ await client.reportComment(
   commentId: 'comment_id',
   reason: 'Contains unmarked spoilers',
 );
+```
+
+---
+
+## 🧩 Extensions
+
+The package includes helpful extensions on the `Comment` model to simplify interactions.
+
+### CommentActions
+
+Methods available on `Comment` instances:
+
+*   `upVote(CommentumClient client)`: Upvote the comment.
+*   `downVote(CommentumClient client)`: Downvote the comment.
+*   `removeVote(CommentumClient client)`: Remove your vote.
+*   `report(CommentumClient client, String reason)`: Report the comment.
+*   `delete(CommentumClient client)`: Delete the comment.
+
+**Example:**
+
+```dart
+final comment = response.data.first;
+
+// Easy interaction
+await comment.upVote(client);
 ```
 
 ---
