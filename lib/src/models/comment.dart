@@ -42,8 +42,6 @@ class Comment {
   factory Comment.fromJson(Map<String, dynamic> json) {
     final user = json['user'] as Map<String, dynamic>?;
 
-    print(json['user_vote']);
-
     return Comment(
       id: json['id']?.toString() ?? '',
       content: json['content'] ?? '',
