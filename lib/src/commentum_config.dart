@@ -5,6 +5,7 @@ enum CommentumProvider {
 }
 
 extension CommentumProviderExt on CommentumProvider {
+  /// The string identifier sent to or received from the Commentum API backend.
   String get apiValue {
     switch (this) {
       case CommentumProvider.anilist:
@@ -15,14 +16,48 @@ extension CommentumProviderExt on CommentumProvider {
         return 'simkl';
     }
   }
+
+  /// Human-readable display name suitable for UI display.
+  String get displayName {
+    switch (this) {
+      case CommentumProvider.anilist:
+        return 'AniList';
+      case CommentumProvider.myanimelist:
+        return 'MyAnimeList';
+      case CommentumProvider.simkl:
+        return 'Simkl';
+    }
+  }
+
+  /// Resolves a [CommentumProvider] from its backend [apiValue] or enum name.
+  static CommentumProvider? fromString(String value) {
+    final lower = value.toLowerCase();
+    for (final provider in CommentumProvider.values) {
+      if (provider.apiValue == lower || provider.name.toLowerCase() == lower) {
+        return provider;
+      }
+    }
+    return null;
+  }
 }
 
 class CommentumConfig {
+  /// Base URL of the backend Commentum API server.
   final String baseUrl;
+
+  /// Identifier of the client app (e.g., 'web', 'android', 'ios', 'shonenx').
   final String? appClient;
+
+  /// Timeout duration for connecting to the API server.
   final Duration connectTimeout;
+
+  /// Timeout duration for receiving HTTP responses.
   final Duration receiveTimeout;
+
+  /// Whether basic request/response URL logging is enabled.
   final bool enableLogging;
+
+  /// Whether verbose JSON headers & body structured logging is enabled.
   final bool verboseLogging;
 
   const CommentumConfig({

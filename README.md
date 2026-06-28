@@ -5,7 +5,7 @@
 
 A robust, type-safe, and modular Dart client for the **Commentum API**.
 
-This package provides a complete interface for integrating comment threads, voting systems, and moderation tools into Dart and Flutter applications. It features a storage-agnostic architecture, enabling seamless integration with `flutter_secure_storage`, `hive`, or `shared_preferences`.
+Designed to make integrating comment threads, voting systems, and moderation tools effortless. Features multi-account session management, a clean modular architecture, named parameters to prevent argument errors, and a storage-agnostic design with built-in in-memory fallback.
 
 ---
 
@@ -14,10 +14,10 @@ This package provides a complete interface for integrating comment threads, voti
 - [Features](#-features)
 - [Installation](#-installation)
 - [Getting Started](#-getting-started)
-  - [1. Implement Storage](#1-implement-storage)
+  - [1. Choose or Implement Storage](#1-choose-or-implement-storage)
   - [2. Initialize Client](#2-initialize-client)
-- [Usage](#-usage)
-  - [Authentication](#authentication)
+- [Architecture & Usage](#-architecture--usage)
+  - [Authentication & Multi-Account Management](#authentication--multi-account-management)
   - [Comments & Threads](#comments--threads)
   - [Interactions (Votes & Reports)](#interactions-votes--reports)
   - [Extensions](#-extensions)
@@ -28,12 +28,11 @@ This package provides a complete interface for integrating comment threads, voti
 
 ## ✨ Features
 
-* **Multi-Provider Authentication**: Native support for **AniList**, **MyAnimeList**, and **Simkl** OAuth flows.
-* **Automatic Token Management**: Handles JWT storage, injection, and session lifecycle automatically.
-* **Type-Safe Models**: Fully typed responses for `Comment`, `User`, and `Reply` objects.
-* **Cursor Pagination**: Built-in support for efficient, infinite-scroll pagination.
-* **Optimistic UI Ready**: Returns standardized objects that make optimistic UI updates easy to implement.
-* **Platform Agnostic**: Works in Flutter, AngularDart, or pure Dart CLIs.
+* **Modular Architecture**: Cleanly separated sub-services (`client.auth`, `client.comments`, `client.interactions`) alongside convenient top-level facades.
+* **Multi-Account Management**: Log into multiple providers simultaneously (**AniList**, **MyAnimeList**, **Simkl**), switch active accounts seamlessly, and load all profiles concurrently.
+* **Named Parameters & Validation**: Prevents parameter order mix-ups and provides instant local validation before network dispatch.
+* **Storage Agnostic**: Supports `flutter_secure_storage`, `shared_preferences`, `hive`, or the built-in `InMemoryCommentumStorage`.
+* **Type-Safe Exceptions**: Granular hierarchy (`CommentumAuthException`, `CommentumValidationException`, `CommentumNetworkException`, `CommentumServerException`).
 
 ---
 
@@ -43,17 +42,16 @@ Add `commentum_client` to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  commentum_client:
-    path: ../packages/commentum_client # or git url
+  commentum_client: ^1.1.0
 ```
 
 ---
 
 ## 🚀 Getting Started
 
-### 1. Implement Storage
+### 1. Choose or Implement Storage
 
-To keep the package platform-agnostic, you must provide a storage implementation for persisting authentication tokens.
+You can use the ready-to-use `InMemoryCommentumStorage` or implement `CommentumStorage` for persistence across app restarts.
 
 *Example using `flutter_secure_storage`:*
 
@@ -77,136 +75,125 @@ class SecureTokenStorage implements CommentumStorage {
   @override
   Future<void> deleteToken(CommentumProvider provider) =>
       _storage.delete(key: _key(provider));
+
+  @override
+  Future<Map<CommentumProvider, String>> getAllTokens() async {
+    final tokens = <CommentumProvider, String>{};
+    for (final provider in CommentumProvider.values) {
+      final token = await getToken(provider);
+      if (token != null && token.isNotEmpty) tokens[provider] = token;
+    }
+    return tokens;
+  }
+
+  @override
+  Future<void> clearAll() async {
+    for (final provider in CommentumProvider.values) {
+      await deleteToken(provider);
+    }
+  }
 }
 ```
 
 ### 2. Initialize Client
 
-Create a global instance of the client (using Riverpod, GetIt, or Provider) and initialize it at app startup.
+Create your client and hydrate its state at startup. All persisted multi-account tokens are restored automatically.
 
 ```dart
 final client = CommentumClient(
   config: const CommentumConfig(
-    baseUrl: 'https://<SUPABASE_API>.supabase.co/functions/v1',
-    enableLogging: true, // Disable in production
+    baseUrl: 'https://api.yourdomain.com/v1',
+    appClient: 'shonenx_mobile',
+    enableLogging: true,
   ),
-  storage: SecureTokenStorage(),
-  preferredProvider: CommentumProvider.anilist
+  storage: SecureTokenStorage(), // Or InMemoryCommentumStorage()
+  preferredProvider: CommentumProvider.anilist,
 );
 
 void main() async {
-  // Hydrate authentication state from storage
-  await client.init();
+  await client.init(); // Loads all logged-in accounts
   runApp(MyApp());
 }
 ```
 
 ---
 
-## 💻 Usage
+## 💻 Architecture & Usage
 
-### Authentication
+You can access endpoints through dedicated modules (`client.auth`, `client.comments`, `client.interactions`) or directly on `client`.
 
-Exchange a third-party access token (e.g., from Simkl OAuth) for a Commentum session. The client caches the result automatically.
+### Authentication & Multi-Account Management
 
 ```dart
-try {
-  // Login with Simkl
-  await client.login(CommentumProvider.simkl, 'simkl_access_token');
-  
-  print('Logged in successfully!');
-} on CommentumError catch (e) {
-  print('Login failed: ${e.message}');
-}
+// Login with a provider
+await client.auth.login(CommentumProvider.anilist, 'oauth_access_token');
+await client.auth.login(CommentumProvider.myanimelist, 'mal_access_token');
 
-// Check login status
-if (client.isLoggedIn) {
-  final user = await client.getMe();
-}
+// Check logged-in providers
+print(client.loggedInProviders); // [CommentumProvider.anilist, CommentumProvider.myanimelist]
 
-// Logout
-await client.logout();
+// Switch active account context for posting
+client.switchProvider(CommentumProvider.myanimelist);
+
+// Get profiles for all currently logged-in accounts at once
+final profiles = await client.getAllLoggedInProfiles();
+profiles.forEach((provider, user) {
+  print('${provider.displayName}: ${user.username}');
+});
+
+// Logout specific account or all accounts
+await client.logout(CommentumProvider.anilist);
+await client.logoutAll();
 ```
 
 ### Comments & Threads
 
-**Fetching Comments (Root Level)**
+All post methods require clear named parameters.
+
+**Fetching Comments (with optional episode filter)**
 ```dart
-final response = await client.listComments(
-  'media_id_101', 
+final response = await client.comments.listComments(
+  mediaId: '10123',
+  episodeNumber: 3,
   limit: 20,
 );
-
 final comments = response.data;
-final totalCount = response.count;
-final nextCursor = response.nextCursor; // Use for infinite scroll
-```
-
-**Fetching Replies (Threaded)**
-```dart
-final response = await client.listReplies(
-  'root_comment_id',
-  limit: 10,
-);
-
-final replies = response.data;
 ```
 
 **Posting a Comment**
 ```dart
-final newComment = await client.createComment(
-  'media_id_101', 
-  'anilist',
-  'This episode was a masterpiece!',
-  client: 'my_app_v1',
+final newComment = await client.comments.createComment(
+  mediaId: '10123',
+  mediaProvider: 'anilist',
+  episodeNumber: 3,
+  content: 'This episode was incredible!',
 );
 ```
 
-**Replying to a Comment**
+**Replying & Updating**
 ```dart
-final reply = await client.createReply(
-  'parent_comment_id',
-  'I completely agree.',
-  client: 'my_app_v1',
+final reply = await client.comments.createReply(
+  parentId: newComment.id,
+  content: 'Totally agree with you!',
+);
+
+await client.comments.updateComment(
+  commentId: reply.id,
+  content: 'Totally agree! Best animation sequence.',
 );
 ```
 
 ### Interactions (Votes & Reports)
 
-You can interact with comments directly using the extension methods:
-
 ```dart
-// Vote
-await comment.upVote(client);
-await comment.downVote(client);
-await comment.removeVote(client);
+// Upvote (+1) or Downvote (-1). Sending the same vote twice toggles/removes it!
+await client.interactions.upvote(commentId: 'comment_123');
+await client.interactions.downvote(commentId: 'comment_123');
 
-// Delete
-await comment.delete(client);
-
-// Report
-await comment.report(client, 'Contains unmarked spoilers');
-```
-
-Alternatively, use the client methods directly:
-
-**Voting**
-```dart
-// Upvote
-await client.voteComment('comment_id', 1);
-
-// Downvote
-await client.voteComment('comment_id', -1);
-
-// Remove Vote
-await client.voteComment('comment_id', 0);
-```
-
-**Reporting Content**
-```dart
-await client.reportComment(
-  commentId: 'comment_id',
-  reason: 'Contains unmarked spoilers',
+// Report harmful content
+await client.interactions.reportComment(
+  commentId: 'comment_123',
+  reason: 'Unmarked spoilers',
 );
 ```
 
@@ -214,68 +201,39 @@ await client.reportComment(
 
 ## 🧩 Extensions
 
-The package includes helpful extensions on the `Comment` model to simplify interactions.
-
-### CommentActions
-
-Methods available on `Comment` instances:
-
-*   `upVote(CommentumClient client)`: Upvote the comment.
-*   `downVote(CommentumClient client)`: Downvote the comment.
-*   `removeVote(CommentumClient client)`: Remove your vote.
-*   `report(CommentumClient client, String reason)`: Report the comment.
-*   `delete(CommentumClient client)`: Delete the comment.
-
-**Example:**
+The `CommentActions` extension provides direct interaction methods on any `Comment` instance:
 
 ```dart
 final comment = response.data.first;
 
-// Easy interaction
 await comment.upVote(client);
+await comment.downVote(client);
+await comment.report(client, 'Spam');
+await comment.delete(client);
 ```
 
 ---
 
 ## ⚠️ Error Handling
 
-All API methods throw a `CommentumError` when operations fail.
+Catch granular typed exceptions to handle error states gracefully:
 
 ```dart
 try {
-  await client.createComment('101', 'Hello');
-} on CommentumError catch (e) {
-  switch (e.status) {
-    case 401:
-      // Handle session expiry
-      break;
-    case 429:
-      // Handle rate limiting
-      break;
-    default:
-      // Handle generic errors
-      print('Error: ${e.message}');
-  }
-} catch (e) {
-  // Handle network/connection errors
+  await client.createComment(
+    mediaId: '101',
+    mediaProvider: 'anilist',
+    content: '', // Will fail validation
+  );
+} on CommentumValidationException catch (e) {
+  print('Invalid input: ${e.message}');
+} on CommentumAuthException catch (e) {
+  print('Auth issue [${e.statusCode}]: Please log in again.');
+} on CommentumServerException catch (e) {
+  print('API Server Error [${e.statusCode}]: ${e.message}');
+} on CommentumNetworkException catch (e) {
+  print('Network failure: ${e.message}');
 }
-```
-
----
-
-## 🛠 Advanced Configuration
-
-You can customize the underlying HTTP client for testing or interceptors (e.g., using `http.Client` wrappers or `MockClient`).
-
-```dart
-final client = CommentumClient(
-  config: CommentumConfig(
-    baseUrl: '...',
-    connectTimeout: Duration(seconds: 30),
-  ),
-  storage: storage,
-  httpClient: CustomHttpClient(), // Inject custom client here
-);
 ```
 
 ---

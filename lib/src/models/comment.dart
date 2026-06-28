@@ -17,6 +17,7 @@ class Comment {
   final String? parentId;
   final String? mediaId;
   final String? mediaProvider;
+  final int? episodeNumber;
   final String? client;
 
   Comment({
@@ -36,6 +37,7 @@ class Comment {
     this.parentId,
     this.mediaId,
     this.mediaProvider,
+    this.episodeNumber,
     this.client,
   });
 
@@ -59,6 +61,7 @@ class Comment {
       parentId: json['parent_id']?.toString(),
       mediaId: json['media_id']?.toString(),
       mediaProvider: json['media_provider']?.toString(),
+      episodeNumber: json['episode_number'] is int ? json['episode_number'] : int.tryParse(json['episode_number']?.toString() ?? ''),
       client: json['client'],
     );
   }
@@ -80,6 +83,7 @@ class Comment {
     String? parentId,
     String? mediaId,
     String? mediaProvider,
+    int? episodeNumber,
     String? client,
   }) {
     return Comment(
@@ -99,6 +103,7 @@ class Comment {
       parentId: parentId ?? this.parentId,
       mediaId: mediaId ?? this.mediaId,
       mediaProvider: mediaProvider ?? this.mediaProvider,
+      episodeNumber: episodeNumber ?? this.episodeNumber,
       client: client ?? this.client,
     );
   }

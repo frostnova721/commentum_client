@@ -2,38 +2,23 @@ import '../commentum_client.dart';
 import 'comment.dart';
 
 extension CommentActions on Comment {
-  /// Upvotes this comment.
-  /// 
-  /// Wraps [CommentumClient.voteComment].
+  /// Upvotes this comment (+1). Sending twice toggles/removes upvote.
   Future<void> upVote(CommentumClient client) async {
-    await client.voteComment(id, 1);
+    await client.interactions.upvote(commentId: id);
   }
 
-  /// Downvotes this comment.
-  /// 
-  /// Wraps [CommentumClient.voteComment].
+  /// Downvotes this comment (-1). Sending twice toggles/removes downvote.
   Future<void> downVote(CommentumClient client) async {
-    await client.voteComment(id, -1);
+    await client.interactions.downvote(commentId: id);
   }
 
-  /// Removes the vote from this comment.
-  /// 
-  /// Wraps [CommentumClient.voteComment].
-  Future<void> removeVote(CommentumClient client) async {
-    await client.voteComment(id, 0);
-  }
-
-  /// Deletes this comment.
-  /// 
-  /// Wraps [CommentumClient.deleteComment].
+  /// Permanently deletes this comment.
   Future<void> delete(CommentumClient client) async {
-    await client.deleteComment(id);
+    await client.comments.deleteComment(commentId: id);
   }
 
-  /// Reports this comment.
-  /// 
-  /// Wraps [CommentumClient.reportComment].
+  /// Reports this comment to moderators.
   Future<void> report(CommentumClient client, String reason) async {
-    await client.reportComment(commentId: id, reason: reason);
+    await client.interactions.reportComment(commentId: id, reason: reason);
   }
 }

@@ -1,463 +1,193 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:developer' as dev;
 import 'package:http/http.dart' as http;
-import './models/comment.dart';
-import './models/error.dart';
-import './models/response.dart';
-import './models/user.dart';
-import 'commentum_storage.dart';
 import 'commentum_config.dart';
+import 'commentum_storage.dart';
+import 'models/comment.dart';
+import 'models/response.dart';
+import 'models/user.dart';
+import 'modules/auth_manager.dart';
+import 'modules/comment_manager.dart';
+import 'modules/interaction_manager.dart';
+import 'network/commentum_http_client.dart';
 
 /// Client for interacting with the Commentum API.
 ///
-/// Handles authentication state, token management, and all CRUD operations
-/// for comments, replies, and votes across multiple providers (AniList, MAL, Simkl).
+/// Designed with a modular architecture:
+/// * [auth]: Manages multi-account logins, token hydration, active provider switching, and profile lookups.
+/// * [comments]: Handles creation, listing, editing, and deletion of comments and replies.
+/// * [interactions]: Handles community voting and moderation reporting.
 class CommentumClient {
   final CommentumConfig config;
   final CommentumStorage storage;
   final CommentumProvider preferredProvider;
-  final http.Client _httpClient;
+  final CommentumHttpClient _network;
 
-  /// In-memory cache of JWTs to minimize async storage reads.
-  final Map<CommentumProvider, String> _tokenCache = {};
-
-  CommentumProvider? _activeProvider;
+  late final CommentumAuthManager auth;
+  late final CommentumCommentManager comments;
+  late final CommentumInteractionManager interactions;
 
   /// Creates a new [CommentumClient] instance.
   ///
-  /// * [config] : Configuration for base URL, timeouts, and logging.
-  /// * [storage] : Persistence strategy for tokens (e.g., SecureStorage, Hive).
-  /// * [preferredProvider] : Initialize with a preferred provider [CommentumProvider].
-  /// * [httpClient] : Optional custom http client for testing or interception.
+  /// * [config]: Configuration for base URL, timeouts, and logging.
+  /// * [storage]: Persistence strategy for tokens (e.g., [InMemoryCommentumStorage] or secure storage).
+  /// * [preferredProvider]: Initial default provider to activate upon hydration.
+  /// * [httpClient]: Optional custom [http.Client] for interception or testing.
   CommentumClient({
     required this.config,
     required this.storage,
     required this.preferredProvider,
     http.Client? httpClient,
-  }) : _httpClient = httpClient ?? http.Client();
+  }) : _network = CommentumHttpClient(config: config, httpClient: httpClient) {
+    auth = CommentumAuthManager(
+      storage: storage,
+      network: _network,
+      defaultProvider: preferredProvider,
+    );
+    comments = CommentumCommentManager(
+      config: config,
+      network: _network,
+      auth: auth,
+    );
+    interactions = CommentumInteractionManager(
+      network: _network,
+      auth: auth,
+    );
+  }
 
-  /// Hydrates the client state by loading persisted tokens from [storage].
-  ///
+  /// Hydrates the client state by loading persisted tokens across all accounts from [storage].
   /// Call this immediately after instantiating the client.
-  Future<void> init() async {
-    final token = await storage.getToken(preferredProvider);
-    if (token != null) {
-      _tokenCache[preferredProvider] = token;
-      _activeProvider = preferredProvider;
-    }
-  }
-
-  /// Sets the active provider context (e.g., [CommentumProvider.anilist]).
-  ///
-  /// Subsequent requests will use the cached token for this provider.
-  void setActiveProvider(CommentumProvider? provider) {
-    _activeProvider = provider;
-  }
+  Future<void> init() => auth.init();
 
   /// The currently active authentication provider.
-  CommentumProvider? get activeProvider => _activeProvider;
+  CommentumProvider? get activeProvider => auth.activeProvider;
+
+  /// Sets the active provider context without validating login status.
+  void setActiveProvider(CommentumProvider? provider) =>
+      auth.setActiveProvider(provider);
+
+  /// Switches the active provider to [provider]. Throws an exception if not logged in.
+  void switchProvider(CommentumProvider provider) =>
+      auth.switchProvider(provider);
 
   /// Whether the [activeProvider] has a valid cached token.
-  bool get isLoggedIn => _activeProvider != null && _tokenCache.containsKey(_activeProvider);
+  bool get isLoggedIn => auth.isLoggedIn;
+
+  /// List of all providers currently authenticated in session cache.
+  List<CommentumProvider> get loggedInProviders => auth.loggedInProviders;
 
   // ---------------------------------------------------------------------------
-  // AUTHENTICATION
+  // AUTH FACADE
   // ---------------------------------------------------------------------------
 
   /// Exchanges a third-party [providerAccessToken] for a Commentum JWT.
-  ///
-  /// * [provider] : The identity provider (e.g., MAL, Simkl).
-  /// * [providerAccessToken] : The access token received from the provider's OAuth flow.
-  ///
-  /// Automatically caches the resulting JWT and sets the provider as active.
-  Future<void> login(CommentumProvider provider, String providerAccessToken) async {
-    final data = await _request(
-      '/auth',
-      method: 'POST',
-      body: {
-        'provider': provider.apiValue,
-        'access_token': providerAccessToken,
-      },
-      useAuth: false,
-    );
+  Future<void> login(CommentumProvider provider, String providerAccessToken) =>
+      auth.login(provider, providerAccessToken);
 
-    final jwt = data['token'];
-    _tokenCache[provider] = jwt;
-    await storage.saveToken(provider, jwt);
+  /// Logs out the specified [provider] (or the active one).
+  Future<void> logout([CommentumProvider? provider]) => auth.logout(provider);
 
-    setActiveProvider(provider);
-  }
-
-  /// Logs out the specified [provider] (or the currently active one).
-  ///
-  /// Clears the token from both memory and [storage].
-  /// Attempts to notify the server to invalidate the session (best-effort).
-  Future<void> logout([CommentumProvider? provider]) async {
-    final targetProvider = provider ?? _activeProvider;
-    if (targetProvider == null) return;
-
-    try {
-      if (_tokenCache.containsKey(targetProvider)) {
-        final prevActive = _activeProvider;
-        _activeProvider = targetProvider;
-        await _request('/auth', method: 'DELETE');
-        _activeProvider = prevActive;
-      }
-    } catch (_) {
-      // Suppress network errors during logout to ensure local cleanup proceeds.
-    }
-
-    _tokenCache.remove(targetProvider);
-    await storage.deleteToken(targetProvider);
-
-    if (_activeProvider == targetProvider) {
-      _activeProvider = null;
-    }
-  }
+  /// Logs out all currently authenticated providers.
+  Future<void> logoutAll() => auth.logoutAll();
 
   /// Fetches the profile of the currently authenticated user.
-  ///
-  /// Throws [CommentumError] if not logged in.
-  Future<User> getMe() async {
-    final data = await _request('/me');
-    return User.fromJson(data['user']);
-  }
+  Future<User> getMe() => auth.getMe();
+
+  /// Fetches user profiles for all currently authenticated accounts concurrently.
+  Future<Map<CommentumProvider, User>> getAllLoggedInProfiles() =>
+      auth.getAllLoggedInProfiles();
 
   // ---------------------------------------------------------------------------
-  // COMMENTS & REPLIES
+  // COMMENTS FACADE
   // ---------------------------------------------------------------------------
 
   /// Creates a new root-level comment on a media item.
-  ///
-  /// [mediaId]
-  /// The unique identifier of the media (anime/manga) in the external database.
-  ///
-  /// Recommendation:
-  /// If using AniList, prefer storing the mal_id provided by AniList so IDs remain consistent across providers.
-
-  /// [mediaProvider]
-  /// The source database the mediaId belongs to.
-  ///
-  /// Examples:
-  /// - "mal" → MyAnimeList ID
-  /// - "anilist" → AniList ID
-  /// - "anilist|mal" or "mal|anilist" → When both providers reference the same ID value
-  ///
-  /// Keep this value consistent to avoid ambiguity when querying or aggregating media.
-
-  /// [content]
-  /// The textual body of the post or comment.
-  /// Must not exceed 500 characters.
-
-  /// [client] (optional)
-  /// Identifier of the client application creating the post
-  /// (e.g., "web", "ios", "android", "api").
-  Future<Comment> createComment(String mediaId, String mediaProvider, String content) async {
-    final data = await _request(
-      '/posts',
-      method: 'POST',
-      body: {'media_id': mediaId, 'media_provider': mediaProvider, 'content': content, 'client': config.appClient},
-    );
-    return Comment.fromJson(data['post']);
-  }
+  Future<Comment> createComment({
+    required String mediaId,
+    required String mediaProvider,
+    required String content,
+    int? episodeNumber,
+  }) =>
+      comments.createComment(
+        mediaId: mediaId,
+        mediaProvider: mediaProvider,
+        content: content,
+        episodeNumber: episodeNumber,
+      );
 
   /// Creates a reply to an existing comment.
-  ///
-  /// * [parentId] : The ID of the comment being replied to.
-  /// * [content] : The text body of the reply.
-  /// * [client] : Optional client identifier.
-  Future<Comment> createReply(String parentId, String content) async {
-    final data = await _request(
-      '/posts',
-      method: 'POST',
-      body: {'parent_id': parentId, 'content': content, 'client': config.appClient},
-    );
-    return Comment.fromJson(data['post']);
-  }
+  Future<Comment> createReply({
+    required String parentId,
+    required String content,
+  }) =>
+      comments.createReply(parentId: parentId, content: content);
 
-  /// Retrieves a paginated list of root comments for the specified [mediaId].
-  ///
-  /// Media ID usage:
-  /// If using AniList as your provider, you may supply either:
-  /// - The AniList media_id, or
-  /// - The mal_id provided by AniList.
-  ///
-  /// Recommendation: Prefer using the mal_id for better cross-provider consistency.
-  ///
-  /// * [limit] : Maximum number of items to return (default: 20).
-  /// * [cursor] : Pagination cursor obtained from a previous CommentumResponse.
-  Future<CommentumResponse> listComments(
-    String mediaId, {
+  /// Retrieves a paginated list of root comments for [mediaId].
+  Future<CommentumResponse> listComments({
+    required String mediaId,
     int limit = 20,
     String? cursor,
-  }) async {
-    final params = {'media_id': mediaId, 'limit': limit.toString()};
-    if (cursor != null) params['cursor'] = cursor;
+    int? episodeNumber,
+  }) =>
+      comments.listComments(
+        mediaId: mediaId,
+        limit: limit,
+        cursor: cursor,
+        episodeNumber: episodeNumber,
+      );
 
-    final data = await _request('/posts', params: params);
-    return CommentumResponse.fromJson(data, isReply: false);
-  }
-
-  /// Retrieves a paginated list of replies.
-  ///
-  /// * [rootId] : The ID of the top-level ancestor comment.
-  /// * [parentId] : (Optional) Filter by direct parent ID.
-  Future<CommentumResponse> listReplies(
-    String rootId, {
-    int limit = 20,
-    String? cursor,
+  /// Retrieves a paginated list of replies under [rootId].
+  Future<CommentumResponse> listReplies({
+    required String rootId,
     String? parentId,
-  }) async {
-    final params = {'root_id': rootId, 'limit': limit.toString()};
-    if (parentId != null) params['parent_id'] = parentId;
-    if (cursor != null) params['cursor'] = cursor;
-
-    final data = await _request('/posts', params: params);
-    return CommentumResponse.fromJson(data, isReply: true);
-  }
+    int limit = 20,
+    String? cursor,
+  }) =>
+      comments.listReplies(
+        rootId: rootId,
+        parentId: parentId,
+        limit: limit,
+        cursor: cursor,
+      );
 
   /// Updates the text content of a comment.
-  ///
-  /// * [commentId] : ID of the comment to edit.
-  /// * [content] : The new text content.
-  Future<Comment> updateComment(String commentId, String content) async {
-    final data = await _request(
-      '/posts',
-      method: 'PATCH',
-      body: {'id': commentId, 'content': content},
-    );
-    return Comment.fromJson(data['post']);
-  }
+  Future<Comment> updateComment({
+    required String commentId,
+    required String content,
+  }) =>
+      comments.updateComment(commentId: commentId, content: content);
 
   /// Deletes a comment by [commentId].
-  ///
-  /// This action is typically irreversible.
-  Future<void> deleteComment(String commentId) async {
-    await _request('/posts?id=$commentId', method: 'DELETE');
-  }
+  Future<void> deleteComment({required String commentId}) =>
+      comments.deleteComment(commentId: commentId);
 
   // ---------------------------------------------------------------------------
-  // INTERACTION
+  // INTERACTIONS FACADE
   // ---------------------------------------------------------------------------
 
-  /// Casts or updates a vote on a comment.
-  ///
-  /// * [commentId] : The target comment ID.
-  /// * [voteType] : `1` (Upvote), `-1` (Downvote), or `0` (Remove vote).
-  Future<void> voteComment(String commentId, int voteType) async {
-    await _request(
-      '/votes',
-      method: 'POST',
-      body: {'post_id': commentId, 'vote_type': voteType},
-    );
-  }
+  /// Casts or toggles a vote on a comment (`1` up, `-1` down). Sending twice toggles/removes it.
+  Future<void> voteComment({
+    required String commentId,
+    required int voteType,
+  }) =>
+      interactions.voteComment(commentId: commentId, voteType: voteType);
+
+  /// Upvotes a comment (+1). Sending twice toggles/removes upvote.
+  Future<void> upvote({required String commentId}) =>
+      interactions.upvote(commentId: commentId);
+
+  /// Downvotes a comment (-1). Sending twice toggles/removes downvote.
+  Future<void> downvote({required String commentId}) =>
+      interactions.downvote(commentId: commentId);
 
   /// Reports a comment for moderation.
-  ///
-  /// * [commentId] : The ID of the offending comment.
-  /// * [reason] : A short string describing the violation (e.g. "Spam", "Spoiler").
   Future<void> reportComment({
     required String commentId,
     required String reason,
-  }) async {
-    await _request(
-      '/reports',
-      method: 'POST',
-      body: {'post_id': commentId, 'reason': reason},
-    );
-  }
+  }) =>
+      interactions.reportComment(commentId: commentId, reason: reason);
 
-  // ---------------------------------------------------------------------------
-  // INTERNAL NETWORKING
-  // ---------------------------------------------------------------------------
-
-  /// Clears an expired or invalid token from memory and storage.
-  Future<void> _clearExpiredToken(CommentumProvider provider) async {
-    _tokenCache.remove(provider);
-    await storage.deleteToken(provider);
-    if (_activeProvider == provider) {
-      _activeProvider = null;
-    }
-  }
-
-  /// Performs the HTTP request, handles auth headers, and parses errors.
-  ///
-  /// Wraps [http.Client] calls with:
-  /// 1. Auth header injection
-  /// 2. Request/Response Logging (if enabled)
-  /// 3. Error handling and wrapping into [CommentumError]
-  Future<dynamic> _request(
-    String endpoint, {
-    String method = 'GET',
-    Map<String, dynamic>? body,
-    Map<String, String>? params,
-    bool useAuth = true,
-  }) async {
-    final url = Uri.parse('${config.baseUrl}$endpoint').replace(
-      queryParameters: params,
-    );
-
-    final headers = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    };
-
-    if (useAuth && _activeProvider != null) {
-      final token = _tokenCache[_activeProvider];
-      if (token != null) {
-        headers['Authorization'] = 'Bearer $token';
-      }
-    }
-
-    // -- Simple Logging --
-    if (config.enableLogging && !config.verboseLogging) {
-      print('[Commentum] $method $url');
-    }
-
-    // -- Verbose Request Logging --
-    if (config.verboseLogging) {
-      _logRequest(method, url, headers, body);
-    }
-
-    final stopwatch = Stopwatch()..start();
-
-    try {
-      http.Response response;
-      final encodedBody = body != null ? jsonEncode(body) : null;
-
-      switch (method.toUpperCase()) {
-        case 'POST':
-          response = await _httpClient.post(url, headers: headers, body: encodedBody);
-          break;
-        case 'PUT':
-          response = await _httpClient.put(url, headers: headers, body: encodedBody);
-          break;
-        case 'PATCH':
-          response = await _httpClient.patch(url, headers: headers, body: encodedBody);
-          break;
-        case 'DELETE':
-          response = await _httpClient.delete(url, headers: headers, body: encodedBody);
-          break;
-        default:
-          response = await _httpClient.get(url, headers: headers);
-      }
-
-      stopwatch.stop();
-
-      // -- Verbose Response Logging --
-      if (config.verboseLogging) {
-        _logResponse(response, stopwatch.elapsedMilliseconds);
-      }
-
-      // Handle 401 Unauthorized - Clear expired token
-      if (response.statusCode == 401 && useAuth && _activeProvider != null) {
-        // Token is expired or invalid, clear it
-        await _clearExpiredToken(_activeProvider!);
-        throw CommentumError('Session expired. Please login again.', 401);
-      }
-
-      final dynamic responseBody;
-      try {
-        responseBody = jsonDecode(response.body);
-      } catch (e) {
-        throw CommentumError('Invalid JSON response from server', response.statusCode);
-      }
-
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw CommentumError(
-          responseBody['error'] ?? 'Unknown Server Error',
-          response.statusCode,
-        );
-      }
-
-      return responseBody;
-    } on http.ClientException catch (e, stackTrace) {
-      stopwatch.stop();
-      if (config.verboseLogging) {
-        _logError(e, stopwatch.elapsedMilliseconds, stackTrace);
-      }
-      throw CommentumError('Network Error: ${e.message}', 0);
-    } catch (e, stackTrace) {
-      stopwatch.stop();
-      if (config.verboseLogging) {
-        _logError(e, stopwatch.elapsedMilliseconds, stackTrace);
-      }
-      if (e is CommentumError) rethrow;
-      throw CommentumError('Unexpected Error: $e', 0);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // LOGGING UTILITIES
-  // ---------------------------------------------------------------------------
-
-  /// Logs outgoing requests in a structured, box-drawing format.
-  void _logRequest(String method, Uri url, Map<String, String> headers, dynamic body) {
-    final buffer = StringBuffer();
-    buffer.writeln('╔══════════════════════════════════════════════════════════════╗');
-    buffer.writeln('║ ↗️ REQUEST');
-    buffer.writeln('╠══════════════════════════════════════════════════════════════');
-    buffer.writeln('║ URL: $method $url');
-    buffer.writeln('║ Headers:');
-    headers.forEach((k, v) => buffer.writeln('║   $k: $v'));
-    if (body != null) {
-      buffer.writeln('║ Body:');
-      _prettyPrintJson(body, buffer);
-    }
-    buffer.writeln('╚══════════════════════════════════════════════════════════════╝');
-    dev.log(buffer.toString(), name: 'Commentum');
-  }
-
-  /// Logs incoming responses, including latency and formatted JSON body.
-  void _logResponse(http.Response response, int latencyMs) {
-    final buffer = StringBuffer();
-    buffer.writeln('╔══════════════════════════════════════════════════════════════╗');
-    buffer.writeln('║ ↘️ RESPONSE [${response.statusCode}] (${latencyMs}ms)');
-    buffer.writeln('╠══════════════════════════════════════════════════════════════');
-    buffer.writeln('║ Headers:');
-    response.headers.forEach((k, v) => buffer.writeln('║   $k: $v'));
-    buffer.writeln('║ Body:');
-    try {
-      final json = jsonDecode(response.body);
-      _prettyPrintJson(json, buffer);
-    } catch (_) {
-      // If body isn't JSON, just print raw
-      buffer.writeln('║   ${response.body}');
-    }
-    buffer.writeln('╚══════════════════════════════════════════════════════════════╝');
-    dev.log(buffer.toString(), name: 'Commentum');
-  }
-
-  /// Logs errors and exceptions, including stack traces if available.
-  void _logError(dynamic error, int latencyMs, [StackTrace? stackTrace]) {
-    final buffer = StringBuffer();
-    buffer.writeln('╔══════════════════════════════════════════════════════════════╗');
-    buffer.writeln('║ ❌ ERROR (${latencyMs}ms)');
-    buffer.writeln('╠══════════════════════════════════════════════════════════════');
-    buffer.writeln('║ Error: $error');
-    if (stackTrace != null) {
-      buffer.writeln('║ StackTrace:');
-      final traceLines = stackTrace.toString().split('\n').take(5); // Limit to top 5 lines
-      for (var line in traceLines) {
-        if (line.isNotEmpty) buffer.writeln('║   $line');
-      }
-    }
-    buffer.writeln('╚══════════════════════════════════════════════════════════════╝');
-    dev.log(buffer.toString(), name: 'Commentum', error: error);
-  }
-
-  /// Helper to indent and format JSON for readability in logs.
-  void _prettyPrintJson(dynamic json, StringBuffer buffer) {
-    var spaces = '║   ';
-    var encoder = JsonEncoder.withIndent('  ');
-    var prettyString = encoder.convert(json);
-    // Indent each line to align with the log box
-    prettyString.split('\n').forEach((element) => buffer.writeln('$spaces$element'));
-  }
-
-  /// Closes the underlying HTTP client.
+  /// Closes the underlying HTTP client resources.
   void dispose() {
-    _httpClient.close();
+    _network.dispose();
   }
 }
